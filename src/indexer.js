@@ -172,8 +172,10 @@ export async function buildContextBundle({ dbPath, query, limit = 8, maxChars = 
   let remaining = maxChars;
   const items = [];
 
-  for (const result of search.results) {
-    const header = `File: ${result.path}:${result.startLine}-${result.endLine}${result.symbol ? ` (${result.symbol})` : ""}\nWhy: ${result.why}; score=${result.score}\n`;
+  for (const result of rolePackedResults(search.results)) {
+    const role = result.role || "snippet";
+    const reason = result.reason || result.why;
+    const header = `File: ${result.path}:${result.startLine}-${result.endLine}${result.symbol ? ` (${result.symbol})` : ""}\nRole: ${role}\nWhy: ${reason}; score=${result.score}\n`;
     const bodyBudget = remaining - header.length - 24;
     if (bodyBudget <= 0) break;
     const snippet = result.snippet.length > bodyBudget
@@ -187,6 +189,8 @@ export async function buildContextBundle({ dbPath, query, limit = 8, maxChars = 
       endLine: result.endLine,
       symbol: result.symbol,
       score: result.score,
+      role,
+      reason,
       why: result.why,
       text: packed,
     });
@@ -201,6 +205,28 @@ export async function buildContextBundle({ dbPath, query, limit = 8, maxChars = 
     context: items.map((item) => item.text).join("\n\n---\n\n"),
     items,
   };
+}
+
+function rolePackedResults(results) {
+  return results.slice().sort((a, b) => {
+    const roleDelta = bundleRolePriority(b.role) - bundleRolePriority(a.role);
+    if (roleDelta !== 0) return roleDelta;
+    if (b.score !== a.score) return b.score - a.score;
+    return a.path.localeCompare(b.path) || a.startLine - b.startLine;
+  });
+}
+
+function bundleRolePriority(role) {
+  switch (role) {
+    case "seed": return 50;
+    case "definition": return 45;
+    case "call-usage": return 40;
+    case "import-export": return 25;
+    case "symbol-reference": return 22;
+    case "test": return 15;
+    case "same-file-neighbor": return 5;
+    default: return 10;
+  }
 }
 
 export function searchReferences({ dbPath, symbol, limit = 25, embeddingProvider }) {

@@ -291,6 +291,7 @@ test("indexRepo skips unchanged files and search retrieves expected auth code", 
   assert.ok(first.status.chunks >= 3);
   assert.ok(first.status.symbols >= 6);
   assert.ok(first.status.references >= 6);
+  assert.ok(first.status.graphEdges >= first.status.symbols);
 
   const second = await indexRepo({ repoPath: fixture, dbPath });
   assert.equal(second.indexed, 0);
@@ -304,6 +305,39 @@ test("indexRepo skips unchanged files and search retrieves expected auth code", 
 
   assert.equal(result.results[0].path, "src/auth.js");
   assert.match(result.results[0].snippet, /authenticateUser|verifyJwtToken/);
+});
+
+test("indexRepo persists first-class graph edges for definitions, exports, and references", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "context-engine-graph-edge-test-"));
+  const dbPath = path.join(tempDir, "index.sqlite");
+  const fixture = new URL("./fixtures/sample-repo", import.meta.url).pathname;
+  await indexRepo({ repoPath: fixture, dbPath });
+
+  const store = new ContextStore(dbPath);
+  try {
+    const edgeTypes = store.db.prepare(`
+      SELECT edge_type AS edgeType, COUNT(*) AS count
+      FROM graph_edges
+      GROUP BY edge_type
+    `).all();
+    const counts = new Map(edgeTypes.map((row) => [row.edgeType, row.count]));
+
+    assert.ok(counts.get("file_defines_symbol") >= 6);
+    assert.ok(counts.get("file_exports_symbol") >= 5);
+    assert.ok(counts.get("symbol_references_symbol") >= 2);
+    assert.ok(counts.get("symbol_referenced_in_file") >= 2);
+
+    const sessionUse = store.db.prepare(`
+      SELECT *
+      FROM graph_edges
+      WHERE edge_type = 'symbol_referenced_in_file'
+        AND source_symbol IN ('function:authenticateUser', 'authenticateUser')
+        AND target_file_path = 'src/session.js'
+    `).get();
+    assert.equal(sessionUse.evidence_line, 5);
+  } finally {
+    store.close();
+  }
 });
 
 test("reference search returns definitions and cross-file references", async () => {
@@ -338,7 +372,11 @@ test("expanded search includes reference callers and import targets", async () =
 
   assert.ok(result.expandRelated);
   assert.ok(result.results.some((entry) => entry.path === "src/auth.js"));
-  assert.ok(result.results.some((entry) => entry.path === "src/session.js" && entry.relatedTo));
+  assert.ok(result.results.some((entry) => (
+    entry.path === "src/session.js" &&
+    entry.relatedTo &&
+    ["call-usage", "definition"].includes(entry.role)
+  )));
 });
 
 test("incrementalIndexRepo updates changed files, removes missing files, and keeps filters conservative", async () => {
@@ -933,7 +971,7 @@ test("hybrid search boosts exact symbol intent ahead of broad related helpers", 
   assert.ok(result.results.find((entry) => entry.symbol === "method:ContextStore.expandRelatedResults").symbolScore > 0);
 });
 
-test("expanded hybrid reranks high-signal related chunks ahead of noisier neighbors", async () => {
+test("graph slice expansion ranks referenced definitions above noisier same-file neighbors", async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "context-engine-related-ranking-test-"));
   const dbPath = path.join(tempDir, "index.sqlite");
   await fs.mkdir(path.join(tempDir, "src"), { recursive: true });
@@ -961,9 +999,16 @@ test("expanded hybrid reranks high-signal related chunks ahead of noisier neighb
     expandRelated: true,
   });
 
-  const relatedSymbols = result.results.filter((entry) => entry.relatedTo).map((entry) => entry.symbol);
-  assert.deepEqual(relatedSymbols, ["function:expandRelatedResults", "function:importTargetChunks"]);
-  assert.equal(result.results[1].why, "same-file neighbor; symbol match");
+  const related = result.results.filter((entry) => entry.relatedTo);
+  const expandDefinition = related.find((entry) => entry.symbol === "function:expandRelatedResults");
+  const noisyNeighbor = related.find((entry) => entry.symbol === "function:importTargetChunks");
+
+  assert.equal(expandDefinition.role, "definition");
+  assert.match(expandDefinition.reason, /function:startFlow references function:expandRelatedResults/);
+  assert.equal(noisyNeighbor.role, "same-file-neighbor");
+  assert.ok(
+    result.results.indexOf(expandDefinition) < result.results.indexOf(noisyNeighbor),
+  );
 });
 
 test("buildContextBundle returns prompt-ready context under budget", async () => {
@@ -983,6 +1028,41 @@ test("buildContextBundle returns prompt-ready context under budget", async () =>
   assert.ok(bundle.context.includes("src/auth.js"));
   assert.ok(bundle.context.includes("authenticateUser"));
   assert.ok(bundle.itemCount >= 1);
+  assert.ok(bundle.items.every((item) => item.role && item.reason && Number.isFinite(item.score)));
+});
+
+test("buildContextBundle packs graph roles before same-file neighbor filler", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "context-engine-bundle-role-test-"));
+  const dbPath = path.join(tempDir, "index.sqlite");
+  await fs.mkdir(path.join(tempDir, "src"), { recursive: true });
+  await fs.writeFile(path.join(tempDir, "src", "flow.js"), [
+    "export function startFlow() {",
+    "  return expandRelatedResults([]);",
+    "}",
+    "",
+    "export function expandRelatedResults(results) {",
+    "  return results.map((result) => result.id);",
+    "}",
+    "",
+    "export function importTargetChunks(filePath) {",
+    "  return [];",
+    "}",
+    "",
+  ].join("\n"));
+
+  await indexRepo({ repoPath: tempDir, dbPath });
+
+  const bundle = await buildContextBundle({
+    dbPath,
+    query: "start flow same file neighbor expand related results",
+    limit: 1,
+    maxChars: 1200,
+  });
+  const symbols = bundle.items.map((item) => item.symbol);
+
+  assert.ok(bundle.context.includes("Role: definition"));
+  assert.ok(symbols.indexOf("function:expandRelatedResults") < symbols.indexOf("function:importTargetChunks"));
+  assert.equal(bundle.items.find((item) => item.symbol === "function:expandRelatedResults").role, "definition");
 });
 
 test("golden eval reports baseline retrieval metrics", async () => {
@@ -1025,10 +1105,10 @@ test("self golden eval suite targets indexed context-engine files", async () => 
   }
 
   assert.equal(result.suite, "self");
-  assert.equal(result.queryCount, 8);
+  assert.equal(result.queryCount, SELF_REPO_GOLDEN_QUERIES.length);
   assert.equal(result.baselines.length, 4);
   assert.deepEqual(result.baselines[0].cases.map((item) => item.id), SELF_REPO_GOLDEN_QUERIES.map((item) => item.id));
   assert.ok(result.indexLatencyMs > 0);
-  assert.ok(result.baselines.every((baseline) => baseline.cases.length === 8));
+  assert.ok(result.baselines.every((baseline) => baseline.cases.length === SELF_REPO_GOLDEN_QUERIES.length));
   assert.ok(result.baselines.every((baseline) => Number.isFinite(baseline.latencyMs)));
 });

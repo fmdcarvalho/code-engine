@@ -52,9 +52,15 @@ export const SELF_REPO_GOLDEN_QUERIES = [
   },
   {
     id: "related-expansion",
-    query: "expand related chunks same file import target symbol reference nearby test",
+    query: "expand related graph slice referenced definitions call usage same file import target symbol reference nearby test",
     expectedFiles: ["src/store.js"],
-    expectedSymbols: ["method:ContextStore.expandRelatedResults"],
+    expectedSymbols: ["method:ContextStore.graphSliceResults", "method:ContextStore.expandRelatedResults"],
+  },
+  {
+    id: "role-aware-bundle",
+    query: "context bundle role reason score role priority packing max chars items metadata",
+    expectedFiles: ["src/indexer.js"],
+    expectedSymbols: ["function:buildContextBundle", "function:rolePackedResults"],
   },
   {
     id: "ollama-adapter",

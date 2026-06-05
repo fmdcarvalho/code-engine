@@ -11,7 +11,7 @@ import {
 } from "./embedding.js";
 import { resolveImportPath, simpleSymbolName, symbolSearchNames } from "./symbols.js";
 
-const SYMBOL_INDEX_VERSION = "1";
+const SYMBOL_INDEX_VERSION = "2";
 
 export class ContextStore {
   constructor(dbPath, { embeddingProvider } = {}) {
@@ -98,6 +98,23 @@ export class ContextStore {
       CREATE INDEX IF NOT EXISTS idx_symbol_references_name ON symbol_references(name);
       CREATE INDEX IF NOT EXISTS idx_symbol_references_target ON symbol_references(target_symbol);
       CREATE INDEX IF NOT EXISTS idx_symbol_references_file_path ON symbol_references(file_path);
+      CREATE TABLE IF NOT EXISTS graph_edges (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        edge_type TEXT NOT NULL,
+        source_file_path TEXT,
+        source_symbol TEXT,
+        source_line INTEGER,
+        target_file_path TEXT,
+        target_symbol TEXT,
+        target_line INTEGER,
+        evidence_file_path TEXT NOT NULL,
+        evidence_line INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_graph_edges_type_source_symbol ON graph_edges(edge_type, source_symbol);
+      CREATE INDEX IF NOT EXISTS idx_graph_edges_type_target_symbol ON graph_edges(edge_type, target_symbol);
+      CREATE INDEX IF NOT EXISTS idx_graph_edges_evidence_file ON graph_edges(evidence_file_path);
+      CREATE INDEX IF NOT EXISTS idx_graph_edges_source_file ON graph_edges(source_file_path);
+      CREATE INDEX IF NOT EXISTS idx_graph_edges_target_file ON graph_edges(target_file_path);
     `);
 
     try {
@@ -155,12 +172,14 @@ export class ContextStore {
     const deleteImports = this.db.prepare("DELETE FROM imports WHERE file_path = ?");
     const deleteExports = this.db.prepare("DELETE FROM exports WHERE file_path = ?");
     const deleteReferences = this.db.prepare("DELETE FROM symbol_references WHERE file_path = ?");
+    const deleteGraphEdges = this.prepareGraphEdgeDelete();
     const insertChunk = this.prepareChunkInsert();
     const insertFts = this.prepareFtsInsert();
     const insertSymbol = this.prepareSymbolInsert();
     const insertImport = this.prepareImportInsert();
     const insertExport = this.prepareExportInsert();
     const insertReference = this.prepareReferenceInsert();
+    const insertGraphEdge = this.prepareGraphEdgeInsert();
 
     this.db.exec("BEGIN");
     try {
@@ -171,8 +190,9 @@ export class ContextStore {
       deleteImports.run(file.path);
       deleteExports.run(file.path);
       deleteReferences.run(file.path);
+      deleteGraphEdges.run(file.path, file.path, file.path);
       this.insertChunkRows(rows, insertChunk, insertFts);
-      this.insertSymbolRows(symbolIndex, { insertSymbol, insertImport, insertExport, insertReference });
+      this.insertSymbolRows(symbolIndex, { insertSymbol, insertImport, insertExport, insertReference, insertGraphEdge });
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -234,10 +254,12 @@ export class ContextStore {
     const stored = this.db.prepare("SELECT path FROM files").all().map((row) => row.path);
     const deleteFile = this.db.prepare("DELETE FROM files WHERE path = ?");
     const deleteFts = this.ftsEnabled ? this.db.prepare("DELETE FROM chunks_fts WHERE file_path = ?") : null;
+    const deleteGraphEdges = this.prepareGraphEdgeDelete();
     let removed = 0;
     for (const filePath of stored) {
       if (!paths.has(filePath)) {
         deleteFts?.run(filePath);
+        deleteGraphEdges.run(filePath, filePath, filePath);
         deleteFile.run(filePath);
         removed += 1;
       }
@@ -253,6 +275,7 @@ export class ContextStore {
       chunks: this.chunkCount(),
       symbols: this.symbolCount(),
       references: this.referenceCount(),
+      graphEdges: this.graphEdgeCount(),
       ftsEnabled: this.ftsEnabled,
       embeddingProvider: metadata?.provider || this.embeddingProvider.name,
       embeddingDims: metadata?.dims || this.embeddingProvider.dims,
@@ -278,7 +301,7 @@ export class ContextStore {
     const results = scored
       .sort((a, b) => b.score - a.score)
       .slice(0, limit);
-    return expandRelated ? this.expandRelatedResults(results, { limit, queryAnalysis }) : results;
+    return expandRelated ? this.expandRelatedResults(results, { limit, query, queryAnalysis }) : results;
   }
 
   referenceSearch(symbol, { limit = 25 } = {}) {
@@ -312,27 +335,36 @@ export class ContextStore {
     `).all(...names, ...names, limit).map(formatSymbol);
   }
 
-  expandRelatedResults(results, { limit = 8, queryAnalysis = analyzeQuery("") } = {}) {
+  expandRelatedResults(results, { limit = 8, query = "", queryAnalysis = analyzeQuery(query) } = {}) {
     const cap = Math.max(limit, limit * 3);
     const candidates = new Map();
 
-    const add = (result, { relatedTo = null, why = null, relationRank = 0 } = {}) => {
-      if (!result) return;
-      const candidate = relatedTo
-        ? scoreRelatedResult(result, { relatedTo, why, relationRank, queryAnalysis })
-        : { ...result, baseResult: true };
+    const addCandidate = (candidate) => {
+      if (!candidate) return;
       const existing = candidates.get(candidate.id);
-      if (!existing || candidate.score > existing.score || (!existing.baseResult && candidate.baseResult)) {
+      if (!existing || compareExpandedResults(candidate, existing) < 0) {
         candidates.set(candidate.id, candidate);
       }
     };
 
-    for (const result of results) add(result);
+    for (const result of this.graphSliceResults(results, { query, limit: cap, queryAnalysis })) {
+      addCandidate(result);
+    }
+
+    const addLegacy = (result, { relatedTo = null, why = null, relationRank = 0 } = {}) => {
+      if (!result) return;
+      const candidate = relatedTo
+        ? scoreRelatedResult(result, { relatedTo, why, relationRank: relationRank + 20, queryAnalysis })
+        : { ...result, baseResult: true, role: result.role || "seed", reason: result.reason || result.why };
+      addCandidate(candidate);
+    };
+
+    for (const result of results) addLegacy(result);
 
     for (const result of results) {
       const relatedChunks = this.relatedChunksForResult(result);
       for (const [index, related] of relatedChunks.entries()) {
-        add(related.chunk, { relatedTo: result.id, why: related.why, relationRank: index });
+        addLegacy(related.chunk, { relatedTo: result.id, why: related.why, relationRank: index });
       }
     }
 
@@ -340,6 +372,180 @@ export class ContextStore {
       .sort(compareExpandedResults)
       .slice(0, cap)
       .map(({ baseResult, relatedRank, ...result }) => result);
+  }
+
+  graphSliceResults(baseResults, {
+    query = "",
+    limit = 24,
+    seedSymbols,
+    maxWalkDepth = 2,
+    queryAnalysis = analyzeQuery(query),
+  } = {}) {
+    const candidates = new Map();
+    const seedResultBySymbol = new Map();
+
+    const add = (result) => {
+      if (!result) return;
+      const existing = candidates.get(result.id);
+      if (!existing || compareExpandedResults(result, existing) < 0) {
+        candidates.set(result.id, result);
+      }
+    };
+
+    for (const result of baseResults) {
+      const seed = {
+        ...result,
+        baseResult: true,
+        role: result.role || "seed",
+        reason: result.reason || result.why,
+      };
+      add(seed);
+      if (result.symbol) seedResultBySymbol.set(result.symbol, seed);
+    }
+
+    const seeds = this.seedSymbolsForGraph(baseResults, seedSymbols);
+    for (const seed of seeds) {
+      if (!seedResultBySymbol.has(seed)) {
+        seedResultBySymbol.set(seed, baseResults.find((result) => result.symbol === seed) || null);
+      }
+    }
+
+    let relationRank = 0;
+    for (const seed of seeds) {
+      const seedResult = seedResultBySymbol.get(seed) || null;
+      const seedScore = Number(seedResult?.score) || 0;
+
+      for (const edge of this.symbolReferenceTargetEdges(seed)) {
+        const definition = this.definitionChunkForSymbol(edge.target_symbol);
+        if (!definition) continue;
+        add(this.graphResult(definition, {
+          role: "definition",
+          why: `definition reached from ${seed}`,
+          reason: `${seed} references ${edge.target_symbol} at ${edge.evidence_file_path}:${edge.evidence_line}`,
+          relatedTo: seedResult?.id || null,
+          seedSymbol: seed,
+          relationRank: relationRank++,
+          score: graphScore(seedScore, "definition"),
+          queryAnalysis,
+        }));
+      }
+
+      if (maxWalkDepth < 2) continue;
+      for (const edge of this.symbolReferencedInFileEdges(seed)) {
+        const usageChunk = this.chunkContaining(edge.target_file_path, edge.target_line || edge.evidence_line);
+        add(this.graphResult(usageChunk, {
+          role: "call-usage",
+          why: `${seed} referenced in file`,
+          reason: `${seed} referenced at ${edge.evidence_file_path}:${edge.evidence_line}`,
+          relatedTo: seedResult?.id || null,
+          seedSymbol: seed,
+          relationRank: relationRank++,
+          score: graphScore(seedScore, "call-usage"),
+          queryAnalysis,
+        }));
+
+        for (const exported of this.exportedSymbolsForFile(edge.target_file_path)) {
+          const definition = this.definitionChunkForSymbol(`${exported.kind}:${exported.name}`);
+          if (!definition) continue;
+          add(this.graphResult(definition, {
+            role: "definition",
+            why: `exported definition in file referencing ${seed}`,
+            reason: `${seed} is used in ${edge.target_file_path}; ${exported.kind}:${exported.name} is exported there`,
+            relatedTo: seedResult?.id || null,
+            seedSymbol: seed,
+            relationRank: relationRank++,
+            score: graphScore(seedScore, "export-definition"),
+            queryAnalysis,
+          }));
+        }
+      }
+    }
+
+    return [...candidates.values()]
+      .sort(compareExpandedResults)
+      .slice(0, limit)
+      .map(({ baseResult, relatedRank, ...result }) => result);
+  }
+
+  seedSymbolsForGraph(baseResults, explicitSeeds) {
+    if (explicitSeeds?.length) return [...new Set(explicitSeeds.filter(Boolean))];
+    const seeds = baseResults
+      .filter((result) => result.symbol && Number(result.symbolScore) >= 0.55)
+      .map((result) => result.symbol);
+    if (seeds.length) return [...new Set(seeds)];
+    return [...new Set(baseResults.filter((result) => result.symbol).slice(0, 2).map((result) => result.symbol))];
+  }
+
+  symbolReferenceTargetEdges(symbol) {
+    const names = symbolSearchNames(symbol);
+    if (!names.length) return [];
+    const placeholders = names.map(() => "?").join(", ");
+    return this.db.prepare(`
+      SELECT *
+      FROM graph_edges
+      WHERE edge_type = 'symbol_references_symbol'
+        AND source_symbol IN (${placeholders})
+        AND target_symbol IS NOT NULL
+      ORDER BY evidence_file_path, evidence_line
+      LIMIT 12
+    `).all(...names);
+  }
+
+  symbolReferencedInFileEdges(symbol) {
+    const names = symbolSearchNames(symbol);
+    if (!names.length) return [];
+    const placeholders = names.map(() => "?").join(", ");
+    return this.db.prepare(`
+      SELECT *
+      FROM graph_edges
+      WHERE edge_type = 'symbol_referenced_in_file'
+        AND source_symbol IN (${placeholders})
+        AND target_file_path IS NOT NULL
+      ORDER BY evidence_file_path, evidence_line
+      LIMIT 12
+    `).all(...names);
+  }
+
+  exportedSymbolsForFile(filePath) {
+    return this.db.prepare(`
+      SELECT *
+      FROM symbols
+      WHERE file_path = ? AND exported = 1
+      ORDER BY start_line
+      LIMIT 12
+    `).all(filePath);
+  }
+
+  definitionChunkForSymbol(symbol) {
+    const names = symbolSearchNames(symbol);
+    if (!names.length) return null;
+    const placeholders = names.map(() => "?").join(", ");
+    const row = this.db.prepare(`
+      SELECT *
+      FROM symbols
+      WHERE kind || ':' || name IN (${placeholders})
+         OR name IN (${placeholders})
+      ORDER BY exported DESC, start_line
+      LIMIT 1
+    `).get(...names, ...names);
+    return row ? this.chunkContaining(row.file_path, row.start_line) : null;
+  }
+
+  graphResult(row, { role, why, reason, relatedTo, seedSymbol, relationRank, score, queryAnalysis }) {
+    if (!row) return null;
+    const result = formatRelatedResult(row, why);
+    const symbolScore = symbolAwareScore(queryAnalysis, resultRowFromResult(result));
+    return {
+      ...result,
+      role,
+      reason,
+      relatedTo,
+      seedSymbol,
+      relatedRank: relationRank,
+      score: Number((score + 0.08 * symbolScore).toFixed(4)),
+      symbolScore: Number(symbolScore.toFixed(4)),
+      relationScore: 1,
+    };
   }
 
   relatedChunksForResult(result) {
@@ -523,6 +729,10 @@ export class ContextStore {
     return this.db.prepare("SELECT COUNT(*) AS count FROM symbol_references").get().count;
   }
 
+  graphEdgeCount() {
+    return this.db.prepare("SELECT COUNT(*) AS count FROM graph_edges").get().count;
+  }
+
   async prepareChunkRows(chunks) {
     const rows = [];
     for (const chunk of chunks) {
@@ -577,6 +787,32 @@ export class ContextStore {
     `);
   }
 
+  prepareGraphEdgeInsert() {
+    return this.db.prepare(`
+      INSERT INTO graph_edges(
+        edge_type,
+        source_file_path,
+        source_symbol,
+        source_line,
+        target_file_path,
+        target_symbol,
+        target_line,
+        evidence_file_path,
+        evidence_line
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+  }
+
+  prepareGraphEdgeDelete() {
+    return this.db.prepare(`
+      DELETE FROM graph_edges
+      WHERE evidence_file_path = ?
+         OR source_file_path = ?
+         OR target_file_path = ?
+    `);
+  }
+
   insertChunkRows(rows, insertChunk, insertFts) {
     for (const { chunk, vector, tokenCount } of rows) {
       insertChunk.run(
@@ -623,7 +859,96 @@ export class ContextStore {
         entry.kind,
       );
     }
+    this.insertGraphEdgeRows(index, statements.insertGraphEdge);
   }
+
+  insertGraphEdgeRows(symbolIndex, insertGraphEdge) {
+    if (!insertGraphEdge) return;
+    const index = symbolIndex || emptySymbolIndex();
+    const definitions = index.definitions || [];
+    const importsByLocalName = new Map((index.imports || []).map((entry) => [entry.localName, entry]));
+
+    const insert = (edge) => {
+      insertGraphEdge.run(
+        edge.edgeType,
+        edge.sourceFilePath || null,
+        edge.sourceSymbol || null,
+        edge.sourceLine || null,
+        edge.targetFilePath || null,
+        edge.targetSymbol || null,
+        edge.targetLine || null,
+        edge.evidenceFilePath,
+        edge.evidenceLine || 1,
+      );
+    };
+
+    for (const symbol of definitions) {
+      const fullSymbol = `${symbol.kind}:${symbol.name}`;
+      insert({
+        edgeType: "file_defines_symbol",
+        sourceFilePath: symbol.filePath,
+        sourceLine: symbol.startLine,
+        targetFilePath: symbol.filePath,
+        targetSymbol: fullSymbol,
+        targetLine: symbol.startLine,
+        evidenceFilePath: symbol.filePath,
+        evidenceLine: symbol.startLine,
+      });
+      if (symbol.exported) {
+        insert({
+          edgeType: "file_exports_symbol",
+          sourceFilePath: symbol.filePath,
+          sourceLine: symbol.startLine,
+          targetFilePath: symbol.filePath,
+          targetSymbol: fullSymbol,
+          targetLine: symbol.startLine,
+          evidenceFilePath: symbol.filePath,
+          evidenceLine: symbol.startLine,
+        });
+      }
+    }
+
+    for (const reference of index.references || []) {
+      const imported = importsByLocalName.get(reference.name);
+      if (imported && reference.line === imported.line) continue;
+      const importedTarget = imported
+        ? (imported.importedName === "default" || imported.importedName === "*" ? imported.localName : imported.importedName)
+        : null;
+      const targetSymbol = reference.targetSymbol || importedTarget;
+      if (!targetSymbol) continue;
+      const containing = containingDefinition(definitions, reference);
+      const sourceSymbol = containing ? `${containing.kind}:${containing.name}` : null;
+      if (sourceSymbol && sourceSymbol !== targetSymbol) {
+        insert({
+          edgeType: "symbol_references_symbol",
+          sourceFilePath: reference.filePath,
+          sourceSymbol,
+          sourceLine: containing.startLine,
+          targetSymbol,
+          evidenceFilePath: reference.filePath,
+          evidenceLine: reference.line,
+        });
+      }
+      insert({
+        edgeType: "symbol_referenced_in_file",
+        sourceSymbol: targetSymbol,
+        targetFilePath: reference.filePath,
+        targetLine: reference.line,
+        evidenceFilePath: reference.filePath,
+        evidenceLine: reference.line,
+      });
+    }
+  }
+}
+
+function containingDefinition(definitions, reference) {
+  return definitions
+    .filter((definition) => (
+      definition.filePath === reference.filePath &&
+      definition.startLine <= reference.line &&
+      definition.endLine >= reference.line
+    ))
+    .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0] || null;
 }
 
 function emptySymbolIndex() {
@@ -716,6 +1041,8 @@ function scoreRelatedResult(result, { relatedTo, why, relationRank, queryAnalysi
     ...result,
     relatedTo,
     relatedRank,
+    role: legacyRoleForWhy(why),
+    reason: why || result.reason || result.why,
     why: symbolScore > 0.66 ? `${whyText}; symbol match` : whyText,
     score: Number(score.toFixed(4)),
     symbolScore: Number(Math.max(Number(result.symbolScore) || 0, symbolScore).toFixed(4)),
@@ -724,9 +1051,38 @@ function scoreRelatedResult(result, { relatedTo, why, relationRank, queryAnalysi
 }
 
 function compareExpandedResults(a, b) {
-  if (b.score !== a.score) return b.score - a.score;
   if (Boolean(b.baseResult) !== Boolean(a.baseResult)) return Number(b.baseResult) - Number(a.baseResult);
+  const roleDelta = rolePriority(b.role) - rolePriority(a.role);
+  if (roleDelta !== 0) return roleDelta;
+  if (b.score !== a.score) return b.score - a.score;
   return (a.relatedRank || 0) - (b.relatedRank || 0);
+}
+
+function graphScore(seedScore, role) {
+  const base = Number(seedScore) || 0;
+  const boost = role === "definition" ? 0.1 : role === "call-usage" ? 0.08 : 0.04;
+  return Number(Math.min(1.25, base + boost).toFixed(4));
+}
+
+function rolePriority(role) {
+  switch (role) {
+    case "seed": return 50;
+    case "definition": return 40;
+    case "call-usage": return 35;
+    case "import-export": return 20;
+    case "symbol-reference": return 18;
+    case "test": return 12;
+    case "same-file-neighbor": return 5;
+    default: return 10;
+  }
+}
+
+function legacyRoleForWhy(why) {
+  if (why === "same-file neighbor") return "same-file-neighbor";
+  if (why === "import/export relationship") return "import-export";
+  if (why === "symbol reference") return "symbol-reference";
+  if (why === "nearby test file") return "test";
+  return "related";
 }
 
 function relationWhyScore(queryAnalysis, why) {
@@ -852,6 +1208,7 @@ function clamp01(value) {
 }
 
 function formatResult(row, score, vectorScore, lexicalScore, symbolScore = 0, relationScore = 0) {
+  const why = explain(vectorScore, lexicalScore, symbolScore, relationScore);
   return {
     id: row.id,
     path: row.file_path,
@@ -864,7 +1221,9 @@ function formatResult(row, score, vectorScore, lexicalScore, symbolScore = 0, re
     lexicalScore: Number(lexicalScore.toFixed(4)),
     symbolScore: Number(symbolScore.toFixed(4)),
     relationScore: Number(relationScore.toFixed(4)),
-    why: explain(vectorScore, lexicalScore, symbolScore, relationScore),
+    why,
+    role: "seed",
+    reason: why,
     snippet: row.text,
   };
 }
@@ -883,6 +1242,8 @@ function formatRelatedResult(row, why) {
     symbolScore: 0,
     relationScore: 0,
     why,
+    role: legacyRoleForWhy(why),
+    reason: why,
     snippet: row.text,
   };
 }
